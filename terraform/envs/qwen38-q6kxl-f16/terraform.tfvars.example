@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is git-ignored.
+#
+# Credentials: this environment sets no `profile` anywhere. Export AWS_PROFILE
+# before running terraform (an .envrc with direnv works well), e.g.
+#   export AWS_PROFILE=<account-id>_TKCLabs-Administrator
+#
+# Apply terraform/envs/base first: this environment looks up base's security
+# group by name at plan time and its IAM instance profile at apply time.
+
+# Required. The bearer token llama-server will demand. Alternatively export
+# TF_VAR_llama_api_key instead of setting it here.
+llama_api_key = "replace-me"
+
+# Optional overrides:
+# instance_type = "g6e.2xlarge"
+# subnet_id     = "subnet-0123456789abcdef0"
+# tags          = { Owner = "chris" }
+
+# This environment serves Qwen3.8-27B-UD-Q6_K_XL.gguf (23.6 GiB) with an f16
+# K/V cache. Only that one file is synced from s3://tkclabs-models — log in and
+# copy more over by hand if you want others.

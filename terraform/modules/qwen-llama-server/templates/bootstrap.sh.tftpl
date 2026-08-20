@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# Rendered by terraform/modules/qwen-llama-server/main.tf via templatefile().
+# Cloud-init executes this once, as root, on first boot only. These instances
+# are ephemeral and are not expected to be rebooted, so nothing here re-runs
+# and no systemd unit is installed.
+#
+# Terraform template syntax note: this whole file is a template, so its
+# comments are not comments to Terraform — dollar-brace and percent-brace
+# sequences anywhere in it are interpolations, resolved before the instance
+# ever sees this file. Bash variables are therefore written unbraced ($VAR) so
+# they cannot collide and need escaping. For the same reason readiness is
+# checked with `curl -f` rather than curl's percent-brace http_code writeout.
+set -euo pipefail
+
+exec > >(tee -a /var/log/llama-bootstrap.log) 2>&1
+
+NAME="${name}"
+PORT="${llama_port}"
+CONTAINER="${container_name}"
+API_KEY='${llama_api_key}'
+MODELS_ROOT="${models_root}"
+MODEL_DIR="${models_root}/${model_repo_path}"
+MODEL_FILE="${model_file}"
+MODEL_PATH="/models/${model_repo_path}/${model_file}"
+TIMING_LOG=/var/log/llama-bootstrap-timing.log
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Seconds since kernel boot. Wall-clock deltas are unusable here because chrony
+# steps the clock early in boot, which would silently corrupt any date-based
+# measurement.
+uptime_now() { awk '{print $1}' /proc/uptime; }
+since() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", b - a }'; }
+
+emit() {
+  echo "llama-bootstrap $NAME: $1"
+  echo "llama-bootstrap $NAME: $1" >> "$TIMING_LOG"
+  echo "llama-bootstrap $NAME: $1" > /dev/console 2>/dev/null || true
+  logger -t llama-bootstrap -- "$1" || true
+}
+
+fail() {
+  emit "FAILED at $(since 0 "$(uptime_now)")s: $1"
+  docker ps -a --filter "name=$CONTAINER" || true
+  docker logs --tail 50 "$CONTAINER" 2>&1 || true
+  exit 1
+}
+
+t_start=$(uptime_now)
+
+# --- packages --------------------------------------------------------------
+# DPkg::Lock::Timeout waits out cloud-init's own first-boot package activity
+# instead of racing it and dying on a held lock. apt-get, not apt, which warns
+# that its CLI is unstable for scripting.
+apt-get -o DPkg::Lock::Timeout=600 update
+apt-get -o DPkg::Lock::Timeout=600 install -y ${apt_packages}
+t_apt=$(uptime_now)
+
+# --- model directory on the instance-store NVMe ----------------------------
+# The DLAMI auto-mounts the instance store at /opt/dlami/nvme. It survives
+# reboot but is wiped on stop/start, which is why this is scratch space and the
+# durable copy lives in S3.
+install -d -o ubuntu -g ubuntu "$MODEL_DIR"
+t_mkdir=$(uptime_now)
+
+# --- sync just this instance's quant ---------------------------------------
+aws s3 sync "s3://${models_bucket}/${model_repo_path}" "$MODEL_DIR" \
+  --exclude "*" \
+  --include "${model_file}" \
+  --only-show-errors
+chown -R ubuntu:ubuntu "$MODELS_ROOT"
+t_sync=$(uptime_now)
+
+[ -s "$MODEL_DIR/$MODEL_FILE" ] || fail "model absent after sync: $MODEL_DIR/$MODEL_FILE"
+
+# --- container -------------------------------------------------------------
+docker pull ${container_image}
+t_pull=$(uptime_now)
+
+docker run -d --name "$CONTAINER" \
+  --gpus all \
+  -v "$MODELS_ROOT":/models:ro \
+  -p ${llama_port}:${llama_port} \
+  ${container_image} \
+  --model "$MODEL_PATH" \
+  --alias ${llama_alias} \
+  --no-mmproj --ctx-size ${ctx_size} --batch-size ${batch_size} --parallel ${parallel} \
+  --gpu-layers ${gpu_layers} --flash-attn ${flash_attn} --fit ${fit} \
+  --cache-type-k ${cache_type_k} --cache-type-v ${cache_type_v} \
+  --load-mode ${load_mode} --cache-ram ${cache_ram} \
+  --temperature ${temperature} --top-k ${top_k} --top-p ${top_p} --min-p ${min_p} \
+  --repeat-penalty ${repeat_penalty} --presence-penalty ${presence_penalty} \
+  --host 0.0.0.0 --port ${llama_port} \
+  --spec-draft-n-max ${spec_draft_n_max} --spec-type ${spec_type} \
+  --jinja --reasoning-preserve --no-prefill-assistant \
+  --api-key "$API_KEY" \
+  --chat-template-kwargs '{"preserve_thinking":true}' \
+  --metrics
+t_run=$(uptime_now)
+
+# --- readiness -------------------------------------------------------------
+# llama.cpp answers /health with 503 while the model loads and 200 once it is
+# ready to serve, so curl -f flipping to success is the exact signal wanted.
+# The Authorization header is sent unconditionally so this works whether or not
+# the build exempts /health from --api-key auth.
+SECONDS=0
+until curl -fsS -m 5 -o /dev/null \
+  -H "Authorization: Bearer $API_KEY" \
+  "http://127.0.0.1:$PORT/health"; do
+  if [ "$SECONDS" -ge ${health_timeout_seconds} ]; then
+    fail "no HTTP 200 from /health within ${health_timeout_seconds}s"
+  fi
+  sleep 5
+done
+t_healthy=$(uptime_now)
+
+# --- timing ----------------------------------------------------------------
+# Phase breakdown, not just a total: s3 sync and model load dominate and are
+# precisely what differs between quants, so a single number would hide the
+# comparison these environments exist to make.
+emit "boot->start $(since 0 "$t_start")s | apt $(since "$t_start" "$t_apt")s | mkdir $(since "$t_apt" "$t_mkdir")s | sync $(since "$t_mkdir" "$t_sync")s | pull $(since "$t_sync" "$t_pull")s | run $(since "$t_pull" "$t_run")s | load->healthy $(since "$t_run" "$t_healthy")s"
+emit "TOTAL boot->serving $(since 0 "$t_healthy")s"
+emit "serving $MODEL_FILE on port $PORT via container $CONTAINER"
